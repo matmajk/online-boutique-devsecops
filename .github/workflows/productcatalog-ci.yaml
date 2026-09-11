@@ -10,8 +10,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SERVICE_PATH: src/productcatalogservice
-  INFRASTRUCTURE_PATH: .ci/infrastructure
+  APPLICATION_PATH: application
+  INFRASTRUCTURE_PATH: infrastructure
+  SERVICE_PATH: application/src/productcatalogservice
 
 jobs:
   validate:
@@ -26,14 +27,15 @@ jobs:
       - name: Checkout application repository
         uses: actions/checkout@v7
         with:
+          path: application
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: src/productcatalogservice/go.mod
-          cache-dependency-path: src/productcatalogservice/go.sum
+          go-version-file: application/src/productcatalogservice/go.mod
+          cache-dependency-path: application/src/productcatalogservice/go.sum
 
       - name: Download dependencies
         working-directory: ${{ env.SERVICE_PATH }}
@@ -73,7 +75,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ vars.INFRASTRUCTURE_REPOSITORY }}
-          path: .ci/infrastructure
+          path: infrastructure
           persist-credentials: false
 
       - name: Prepare local tooling configuration
@@ -132,7 +134,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
-          projectBaseDir: src/productcatalogservice
+          projectBaseDir: application/src/productcatalogservice
 
       - name: Validate SonarQube Quality Gate
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -141,7 +143,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
-          scanMetadataReportFile: src/productcatalogservice/.scannerwork/report-task.txt
+          scanMetadataReportFile: application/src/productcatalogservice/.scannerwork/report-task.txt
           pollingTimeoutSec: 300
 
       - name: Capture SonarQube resource usage
@@ -171,3 +173,21 @@ jobs:
           fi
 
           exit "${cleanup_status}"
+
+      - name: Clean generated CI files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          rm -f \
+            "${SERVICE_PATH}/coverage.out" \
+            "${RUNNER_TEMP}/productcatalogservice"
+
+          rm -rf \
+            "${SERVICE_PATH}/.scannerwork"
+
+          if [[ -d "${INFRASTRUCTURE_PATH}" ]]; then
+            rm -f \
+              "${INFRASTRUCTURE_PATH}/local/tooling/.env"
+          fi
