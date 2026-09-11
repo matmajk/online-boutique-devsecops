@@ -1,12 +1,6 @@
 name: Product Catalog CI
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - feat/ci-productcatalog-validation
-    paths:
-      - "src/productcatalogservice/**"
-      - ".github/workflows/productcatalog-ci.yaml"
 
 permissions:
   contents: read
