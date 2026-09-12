@@ -1,6 +1,9 @@
 name: Product Catalog CI
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -17,29 +20,87 @@ env:
   IMAGE_TAG: ci-${{ github.sha }}
 
 jobs:
-  validate:
-    name: Validate productcatalogservice
+  productcatalog-ci:
+    name: Product Catalog Service CI
     runs-on:
       - self-hosted
       - linux
       - x64
       - devsecops-local
-    timeout-minutes: 30
+
     steps:
+      # -----------------------------------------------------------------------
+      # Repository checkout
+      # -----------------------------------------------------------------------
+
       - name: Checkout application repository
         uses: actions/checkout@v7
         with:
-          path: application
+          path: ${{ env.APPLICATION_PATH }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Checkout infrastructure repository
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.INFRASTRUCTURE_REPOSITORY }}
+          path: ${{ env.INFRASTRUCTURE_PATH }}
+          persist-credentials: false
+
+      # -----------------------------------------------------------------------
+      # Local tooling configuration
+      # -----------------------------------------------------------------------
+
+      - name: Prepare local tooling configuration
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          SONAR_DB_PASSWORD: ${{ secrets.SONAR_DB_PASSWORD }}
+          JCR_DB_PASSWORD: ${{ secrets.JCR_DB_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${SONAR_DB_PASSWORD}" ]]; then
+            echo "SONAR_DB_PASSWORD is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${JCR_DB_PASSWORD}" ]]; then
+            echo "JCR_DB_PASSWORD is not configured."
+            exit 1
+          fi
+
+          env_file="${INFRASTRUCTURE_PATH}/local/tooling/.env"
+
+          cp \
+            "${INFRASTRUCTURE_PATH}/local/tooling/.env.example" \
+            "${env_file}"
+
+          sed -i \
+            -e "s|^SONAR_DB_PASSWORD=.*|SONAR_DB_PASSWORD=${SONAR_DB_PASSWORD}|" \
+            -e "s|^JCR_DB_PASSWORD=.*|JCR_DB_PASSWORD=${JCR_DB_PASSWORD}|" \
+            "${env_file}"
+
+          grep -q '^SONAR_DB_PASSWORD=' "${env_file}"
+          grep -q '^JCR_DB_PASSWORD=' "${env_file}"
+
+          chmod 600 "${env_file}"
+
+          echo "Local tooling configuration prepared."
+
+      # -----------------------------------------------------------------------
+      # Go
+      # -----------------------------------------------------------------------
 
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version-file: application/src/productcatalogservice/go.mod
-          cache-dependency-path: application/src/productcatalogservice/go.sum
+          go-version-file: ${{ env.SERVICE_PATH }}/go.mod
+          cache: true
+          cache-dependency-path: ${{ env.SERVICE_PATH }}/go.sum
 
-      - name: Download dependencies
+      - name: Download Go dependencies
         working-directory: ${{ env.SERVICE_PATH }}
         run: go mod download
 
@@ -48,9 +109,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          go test \
-            -coverprofile=coverage.out \
-            ./...
+          go test -coverprofile=coverage.out ./...
 
       - name: Show coverage summary
         working-directory: ${{ env.SERVICE_PATH }}
@@ -61,9 +120,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          go build \
-            -o "${RUNNER_TEMP}/productcatalogservice" \
-            .
+          go build -o "${RUNNER_TEMP}/productcatalogservice" .
 
       - name: Validate binary
         run: |
@@ -71,6 +128,10 @@ jobs:
 
           test -x "${RUNNER_TEMP}/productcatalogservice"
           ls -lh "${RUNNER_TEMP}/productcatalogservice"
+
+      # -----------------------------------------------------------------------
+      # Trivy filesystem scan
+      # -----------------------------------------------------------------------
 
       - name: Scan source dependencies with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -84,6 +145,28 @@ jobs:
           ignore-unfixed: true
           format: table
           exit-code: '1'
+
+      # -----------------------------------------------------------------------
+      # Docker build
+      # -----------------------------------------------------------------------
+
+      - name: Wait for Docker Engine
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          for attempt in {1..30}; do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker Engine is ready."
+              exit 0
+            fi
+
+            echo "Docker Engine is not ready yet. Retrying in 2s..."
+            sleep 2
+          done
+
+          echo "Docker Engine did not become available."
+          exit 1
 
       - name: Build productcatalogservice image
         shell: bash
@@ -103,6 +186,10 @@ jobs:
 
           echo "Successfully built image: ${image_ref}"
 
+      # -----------------------------------------------------------------------
+      # Trivy container image scan
+      # -----------------------------------------------------------------------
+
       - name: Scan container image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
@@ -116,50 +203,9 @@ jobs:
           format: table
           exit-code: '1'
 
-      - name: Remove local CI image
-        if: ${{ always() }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          image_ref="${IMAGE_NAME}:${IMAGE_TAG}"
-
-          if docker image inspect "${image_ref}" >/dev/null 2>&1; then
-            docker image rm --force "${image_ref}"
-          fi
-
-      - name: Checkout infrastructure repository
-        if: ${{ github.ref == 'refs/heads/main' }}
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ vars.INFRASTRUCTURE_REPOSITORY }}
-          path: infrastructure
-          persist-credentials: false
-
-      - name: Prepare local tooling configuration
-        if: ${{ github.ref == 'refs/heads/main' }}
-        shell: bash
-        env:
-          SONAR_DB_PASSWORD: ${{ secrets.SONAR_DB_PASSWORD }}
-        run: |
-          set -Eeuo pipefail
-
-          if [[ -z "${SONAR_DB_PASSWORD}" ]]; then
-            echo "SONAR_DB_PASSWORD is not configured."
-            exit 1
-          fi
-
-          tooling_dir="${INFRASTRUCTURE_PATH}/local/tooling"
-
-          grep -v '^SONAR_DB_PASSWORD=' \
-            "${tooling_dir}/.env.example" \
-            > "${tooling_dir}/.env"
-
-          printf 'SONAR_DB_PASSWORD=%s\n' \
-            "${SONAR_DB_PASSWORD}" \
-            >> "${tooling_dir}/.env"
-
-          chmod 600 "${tooling_dir}/.env"
+      # -----------------------------------------------------------------------
+      # SonarQube analysis
+      # -----------------------------------------------------------------------
 
       - name: Prepare SonarQube resource profile
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -171,7 +217,6 @@ jobs:
           make -C "${INFRASTRUCTURE_PATH}" tooling-jcr-down
 
           make -C "${INFRASTRUCTURE_PATH}" tooling-sonar-up
-          make -C "${INFRASTRUCTURE_PATH}" tooling-sonar-wait
 
       - name: Validate SonarQube readiness
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -192,7 +237,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
-          projectBaseDir: application/src/productcatalogservice
+          projectBaseDir: ${{ env.SERVICE_PATH }}
 
       - name: Validate SonarQube Quality Gate
         if: ${{ github.ref == 'refs/heads/main' }}
@@ -201,7 +246,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
         with:
-          scanMetadataReportFile: application/src/productcatalogservice/.scannerwork/report-task.txt
+          scanMetadataReportFile: ${{ env.SERVICE_PATH }}/.scannerwork/report-task.txt
           pollingTimeoutSec: 300
 
       - name: Capture SonarQube resource usage
@@ -221,16 +266,188 @@ jobs:
           cleanup_status=0
 
           if [[ -d "${INFRASTRUCTURE_PATH}" ]]; then
-            make \
-              -C "${INFRASTRUCTURE_PATH}" \
-              tooling-sonar-down \
-              || cleanup_status=$?
-
-            rm -f \
-              "${INFRASTRUCTURE_PATH}/local/tooling/.env"
+            make -C "${INFRASTRUCTURE_PATH}" tooling-sonar-down || cleanup_status=$?
           fi
 
           exit "${cleanup_status}"
+
+      # -----------------------------------------------------------------------
+      # JFrog Container Registry
+      # -----------------------------------------------------------------------
+
+      - name: Prepare JFrog resource profile
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          make -C "${INFRASTRUCTURE_PATH}" cluster-stop
+          make -C "${INFRASTRUCTURE_PATH}" tooling-sonar-down
+
+          make -C "${INFRASTRUCTURE_PATH}" tooling-jcr-up
+
+      - name: Validate JFrog readiness
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+        run: |
+          set -Eeuo pipefail
+
+          response="$(curl -fsS "http://${JFROG_REGISTRY}/artifactory/api/system/ping")"
+
+          if [[ "${response}" != "OK" ]]; then
+            echo "JFrog Artifactory is not ready."
+            exit 1
+          fi
+
+          echo "JFrog Artifactory is ready."
+
+      - name: Log in to JFrog Container Registry
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+          JFROG_USERNAME: ${{ vars.JFROG_USERNAME }}
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${JFROG_REGISTRY}" ]]; then
+            echo "JFROG_REGISTRY is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${JFROG_USERNAME}" ]]; then
+            echo "JFROG_USERNAME is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${JFROG_TOKEN}" ]]; then
+            echo "JFROG_TOKEN is not configured."
+            exit 1
+          fi
+
+          printf '%s' "${JFROG_TOKEN}" \
+            | docker login \
+                "${JFROG_REGISTRY}" \
+                --username "${JFROG_USERNAME}" \
+                --password-stdin
+
+      - name: Push image to JFrog Container Registry
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+          JFROG_REPOSITORY: ${{ vars.JFROG_DOCKER_REPOSITORY }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${JFROG_REPOSITORY}" ]]; then
+            echo "JFROG_DOCKER_REPOSITORY is not configured."
+            exit 1
+          fi
+
+          source_image="${IMAGE_NAME}:${IMAGE_TAG}"
+          target_image="${JFROG_REGISTRY}/${JFROG_REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Publishing image: ${target_image}"
+
+          docker image inspect "${source_image}" >/dev/null
+
+          docker tag "${source_image}" "${target_image}"
+
+          if ! docker push "${target_image}"; then
+            echo "Failed to publish image to JFrog: ${target_image}"
+            exit 1
+          fi
+
+          echo "Successfully published image: ${target_image}"
+
+      - name: Verify published JFrog image
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+          JFROG_REPOSITORY: ${{ vars.JFROG_DOCKER_REPOSITORY }}
+        run: |
+          set -Eeuo pipefail
+
+          target_image="${JFROG_REGISTRY}/${JFROG_REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Removing local JFrog tag before pull verification."
+
+          docker image rm "${target_image}"
+
+          echo "Pulling published image from JFrog."
+
+          if ! docker pull "${target_image}"; then
+            echo "Failed to pull image from JFrog: ${target_image}"
+            exit 1
+          fi
+
+          docker image inspect "${target_image}" >/dev/null
+
+          echo "Verified published image: ${target_image}"
+
+      - name: Capture JFrog resource usage
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          docker stats \
+            --no-stream \
+            --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}' \
+            | grep -E 'NAME|jcr|artifactory' \
+            || true
+
+      - name: Log out from JFrog Container Registry
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+        run: |
+          if [[ -n "${JFROG_REGISTRY}" ]]; then
+            docker logout "${JFROG_REGISTRY}" || true
+          fi
+
+      - name: Stop JFrog Container Registry
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          cleanup_status=0
+
+          if [[ -d "${INFRASTRUCTURE_PATH}" ]]; then
+            make -C "${INFRASTRUCTURE_PATH}" tooling-jcr-down || cleanup_status=$?
+          fi
+
+          exit "${cleanup_status}"
+
+      # -----------------------------------------------------------------------
+      # Cleanup
+      # -----------------------------------------------------------------------
+
+      - name: Remove local CI image
+        if: ${{ always() }}
+        shell: bash
+        env:
+          JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY }}
+          JFROG_REPOSITORY: ${{ vars.JFROG_DOCKER_REPOSITORY }}
+        run: |
+          set -Eeuo pipefail
+
+          source_image="${IMAGE_NAME}:${IMAGE_TAG}"
+
+          if docker image inspect "${source_image}" >/dev/null 2>&1; then
+            docker image rm --force "${source_image}"
+          fi
+
+          if [[ -n "${JFROG_REGISTRY}" && -n "${JFROG_REPOSITORY}" ]]; then
+            target_image="${JFROG_REGISTRY}/${JFROG_REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+            if docker image inspect "${target_image}" >/dev/null 2>&1; then
+              docker image rm --force "${target_image}"
+            fi
+          fi
 
       - name: Clean generated CI files
         if: ${{ always() }}
@@ -238,14 +455,10 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          rm -f \
-            "${SERVICE_PATH}/coverage.out" \
-            "${RUNNER_TEMP}/productcatalogservice"
+          rm -f "${SERVICE_PATH}/coverage.out" "${RUNNER_TEMP}/productcatalogservice"
 
-          rm -rf \
-            "${SERVICE_PATH}/.scannerwork"
+          rm -rf "${SERVICE_PATH}/.scannerwork"
 
           if [[ -d "${INFRASTRUCTURE_PATH}" ]]; then
-            rm -f \
-              "${INFRASTRUCTURE_PATH}/local/tooling/.env"
+            rm -f "${INFRASTRUCTURE_PATH}/local/tooling/.env"
           fi
