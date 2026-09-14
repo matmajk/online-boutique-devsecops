@@ -390,6 +390,34 @@ jobs:
 
           echo "Verified published image: ${target_image}"
 
+      - name: Dispatch verified artifact to GitOps
+        if: success() && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_DISPATCH_TOKEN }}
+          GITOPS_REPOSITORY: ${{ vars.GITOPS_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          : "${GH_TOKEN:?GITOPS_DISPATCH_TOKEN is required}"
+          : "${GITOPS_REPOSITORY:?GITOPS_REPOSITORY is required}"
+          : "${IMAGE_TAG:?IMAGE_TAG is required}"
+
+          echo "Dispatching verified artifact:"
+          echo "  service:    productcatalogservice"
+          echo "  image tag:  ${IMAGE_TAG}"
+          echo "  source SHA: ${GITHUB_SHA}"
+
+          gh api \
+            --silent \
+            --method POST \
+            "repos/${GITOPS_REPOSITORY}/dispatches" \
+            -H "Accept: application/vnd.github+json" \
+            -f event_type=artifact-published \
+            -f "client_payload[service]=productcatalogservice" \
+            -f "client_payload[image_tag]=${IMAGE_TAG}" \
+            -f "client_payload[source_sha]=${GITHUB_SHA}"
+
       - name: Capture JFrog resource usage
         if: ${{ always() && github.ref == 'refs/heads/main' }}
         shell: bash
