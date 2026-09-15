@@ -276,6 +276,7 @@ jobs:
       # -----------------------------------------------------------------------
 
       - name: Prepare JFrog resource profile
+        id: start_jfrog
         if: ${{ github.ref == 'refs/heads/main' }}
         shell: bash
         run: |
@@ -390,6 +391,42 @@ jobs:
 
           echo "Verified published image: ${target_image}"
 
+      - name: Prepare local delivery runtime
+        if: success() && github.ref == 'refs/heads/main'
+        shell: bash
+        working-directory: infrastructure
+        env:
+          TOOLING_ALLOW_CONCURRENT: "1"
+          JFROG_REGISTRY: "host.docker.internal:8082"
+        run: |
+          set -euo pipefail
+
+          echo "Starting local Kubernetes runtime..."
+          make up
+
+          echo "Waiting for Kubernetes nodes..."
+          make cluster-wait
+
+          echo "Checking Argo CD..."
+          kubectl get namespace argocd >/dev/null
+
+          kubectl wait \
+            --namespace argocd \
+            --for=condition=Ready \
+            pod \
+            --all \
+            --timeout=180s
+
+          echo "Checking JFrog..."
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://localhost:8082/router/api/v1/system/readiness
+
+          echo
+          echo "Local delivery runtime is ready."
+
       - name: Dispatch verified artifact to GitOps
         if: success() && github.ref == 'refs/heads/main'
         shell: bash
@@ -438,8 +475,8 @@ jobs:
             docker logout "${JFROG_REGISTRY}" || true
           fi
 
-      - name: Stop JFrog Container Registry
-        if: ${{ always() && github.ref == 'refs/heads/main' }}
+      - name: Stop JFrog Container Registry on failure
+        if: failure() && steps.start_jfrog.outcome == 'success'
         shell: bash
         run: |
           cleanup_status=0
