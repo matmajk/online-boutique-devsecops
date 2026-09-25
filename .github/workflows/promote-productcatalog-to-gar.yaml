@@ -1,0 +1,280 @@
+name: Promote Product Catalog Artifact to GAR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Validated immutable image tag, for example ci-<40-char-git-sha>"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: productcatalog-artifact-promotion
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPOSITORY: >-
+    ${{ vars.JFROG_REGISTRY }}/${{ vars.JFROG_DOCKER_REPOSITORY }}/${{ vars.IMAGE_NAME }}
+
+  DEST_REPOSITORY: >-
+    ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/${{ vars.IMAGE_NAME }}
+
+jobs:
+  promote:
+    name: Promote validated artifact
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - devsecops-local
+
+    steps:
+
+      # -----------------------------------------------------------------------
+      # Promotion input validation
+      # -----------------------------------------------------------------------
+
+      - name: Validate promotion input
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          IMAGE_TAG="${{ inputs.image_tag }}"
+
+          if [[ ! "${IMAGE_TAG}" =~ ^ci-[0-9a-f]{40}$ ]]; then
+            echo "ERROR: image_tag must match ci-<40-char-git-sha>."
+            echo "Received: ${IMAGE_TAG}"
+            exit 1
+          fi
+
+          echo "Validated promotion input:"
+          echo "  image: ${{ vars.IMAGE_NAME }}"
+          echo "  tag:   ${IMAGE_TAG}"
+
+      # -----------------------------------------------------------------------
+      # Infrastructure repository checkout
+      # -----------------------------------------------------------------------
+
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.INFRASTRUCTURE_REPOSITORY }}
+          path: infrastructure
+
+      # -----------------------------------------------------------------------
+      # Local tooling configuration
+      # -----------------------------------------------------------------------
+
+      - name: Prepare local tooling configuration
+        shell: bash
+        env:
+          JCR_DB_PASSWORD: ${{ secrets.JCR_DB_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          ENV_FILE="infrastructure/local/tooling/.env"
+          ENV_EXAMPLE="infrastructure/local/tooling/.env.example"
+
+          cp "${ENV_EXAMPLE}" "${ENV_FILE}"
+
+          awk '
+            /^JCR_DB_PASSWORD=/ {
+              print "JCR_DB_PASSWORD=" ENVIRON["JCR_DB_PASSWORD"]
+              next
+            }
+            { print }
+          ' "${ENV_FILE}" > "${ENV_FILE}.tmp"
+
+          mv "${ENV_FILE}.tmp" "${ENV_FILE}"
+          chmod 600 "${ENV_FILE}"
+      # -----------------------------------------------------------------------
+      # Local JFrog runtime
+      # -----------------------------------------------------------------------
+
+      - name: Prepare JFrog resource profile
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          make -C infrastructure down
+          make -C infrastructure tooling-sonar-down
+          make -C infrastructure tooling-jcr-up
+
+      - name: Validate Docker Engine
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          docker version
+
+      # -----------------------------------------------------------------------
+      # JFrog authentication
+      # -----------------------------------------------------------------------
+
+      - name: Authenticate to JFrog
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "${{ secrets.JFROG_TOKEN }}" \
+            | docker login "${{ vars.JFROG_REGISTRY }}" \
+                --username "${{ vars.JFROG_USERNAME }}" \
+                --password-stdin
+
+      # -----------------------------------------------------------------------
+      # Source artifact retrieval
+      # -----------------------------------------------------------------------
+
+      - name: Pull validated image from JFrog
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_IMAGE="${SOURCE_REPOSITORY}:${{ inputs.image_tag }}"
+
+          echo "Pulling validated artifact:"
+          echo "  registry:   ${{ vars.JFROG_REGISTRY }}"
+          echo "  repository: ${{ vars.JFROG_DOCKER_REPOSITORY }}"
+          echo "  image:      ${{ vars.IMAGE_NAME }}"
+          echo "  tag:        ${{ inputs.image_tag }}"
+
+          docker pull "${SOURCE_IMAGE}"
+
+      - name: Resolve JFrog image digest
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_IMAGE="${SOURCE_REPOSITORY}:${{ inputs.image_tag }}"
+
+          SOURCE_DIGEST="$(
+            docker image inspect "${SOURCE_IMAGE}" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | grep "^${SOURCE_REPOSITORY}@" \
+              | head -n 1 \
+              | cut -d'@' -f2
+          )"
+
+          if [[ -z "${SOURCE_DIGEST}" ]]; then
+            echo "ERROR: Could not resolve JFrog image digest."
+            exit 1
+          fi
+
+          echo "JFrog digest: ${SOURCE_DIGEST}"
+          echo "digest=${SOURCE_DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # Google Cloud authentication
+      # -----------------------------------------------------------------------
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Artifact Registry authentication
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          gcloud auth configure-docker \
+            "${{ vars.GAR_LOCATION }}-docker.pkg.dev" \
+            --quiet
+
+      # -----------------------------------------------------------------------
+      # Artifact replication to Google Artifact Registry
+      # -----------------------------------------------------------------------
+
+      - name: Push validated image to Artifact Registry
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_IMAGE="${SOURCE_REPOSITORY}:${{ inputs.image_tag }}"
+          DEST_IMAGE="${DEST_REPOSITORY}:${{ inputs.image_tag }}"
+
+          echo "Promoting artifact:"
+          echo "  source:      ${SOURCE_IMAGE}"
+          echo "  destination: ${DEST_IMAGE}"
+          echo "  project:     ${{ vars.GCP_PROJECT_ID }}"
+          echo "  location:    ${{ vars.GAR_LOCATION }}"
+          echo "  repository:  ${{ vars.GAR_REPOSITORY }}"
+
+          docker tag "${SOURCE_IMAGE}" "${DEST_IMAGE}"
+          docker push "${DEST_IMAGE}"
+
+      # -----------------------------------------------------------------------
+      # Artifact integrity verification
+      # -----------------------------------------------------------------------
+
+      - name: Verify Artifact Registry digest
+        shell: bash
+        env:
+          SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+
+          DEST_IMAGE="${DEST_REPOSITORY}:${{ inputs.image_tag }}"
+
+          DEST_DIGEST="$(
+            gcloud artifacts docker images describe \
+              "${DEST_IMAGE}" \
+              --project="${{ vars.GCP_PROJECT_ID }}" \
+              --format='value(image_summary.digest)'
+          )"
+
+          if [[ -z "${DEST_DIGEST}" ]]; then
+            echo "ERROR: Could not resolve Artifact Registry digest."
+            exit 1
+          fi
+
+          echo "Source JFrog digest: ${SOURCE_DIGEST}"
+          echo "Destination GAR digest: ${DEST_DIGEST}"
+
+          if [[ "${SOURCE_DIGEST}" != "${DEST_DIGEST}" ]]; then
+            echo "ERROR: Artifact digest mismatch."
+            echo "JFrog: ${SOURCE_DIGEST}"
+            echo "GAR:   ${DEST_DIGEST}"
+            exit 1
+          fi
+
+          echo "Artifact promotion verified successfully."
+          echo "Immutable digest: ${DEST_DIGEST}"
+
+      # -----------------------------------------------------------------------
+      # Cleanup
+      # -----------------------------------------------------------------------
+
+      - name: Cleanup local images and registry session
+        if: always()
+        shell: bash
+        run: |
+          SOURCE_IMAGE="${SOURCE_REPOSITORY}:${{ inputs.image_tag }}"
+          DEST_IMAGE="${DEST_REPOSITORY}:${{ inputs.image_tag }}"
+
+          docker image rm "${DEST_IMAGE}" 2>/dev/null || true
+          docker image rm "${SOURCE_IMAGE}" 2>/dev/null || true
+
+          docker logout "${{ vars.JFROG_REGISTRY }}" 2>/dev/null || true
+
+      - name: Stop JFrog
+        if: always()
+        shell: bash
+        run: |
+          make -C infrastructure tooling-jcr-down || true
+
+      - name: Remove temporary tooling configuration
+        if: always()
+        shell: bash
+        run: |
+          rm -f infrastructure/local/tooling/.env
