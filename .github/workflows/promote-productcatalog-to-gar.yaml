@@ -11,6 +11,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  statuses: write
 
 concurrency:
   group: productcatalog-artifact-promotion
@@ -110,6 +111,13 @@ jobs:
           set -Eeuo pipefail
 
           docker version
+
+      - name: Validate GitHub CLI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          gh --version
 
       # -----------------------------------------------------------------------
       # JFrog authentication
@@ -250,6 +258,38 @@ jobs:
 
           echo "Artifact promotion verified successfully."
           echo "Immutable digest: ${DEST_DIGEST}"
+
+      # -----------------------------------------------------------------------
+      # GAR promotion recording
+      # -----------------------------------------------------------------------
+
+      - name: Record verified GAR promotion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -Eeuo pipefail
+
+          SOURCE_SHA="${IMAGE_TAG#ci-}"
+
+          if [[ ! "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "ERROR: Could not derive valid source commit SHA from image tag."
+            exit 1
+          fi
+
+          echo "Recording verified GAR promotion:"
+          echo "  repository: ${GITHUB_REPOSITORY}"
+          echo "  commit:     ${SOURCE_SHA}"
+          echo "  tag:        ${IMAGE_TAG}"
+
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${SOURCE_SHA}" \
+            -f state='success' \
+            -f context='artifact/productcatalogservice/gar-stage' \
+            -f description='Artifact promoted and digest-verified in GAR' \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
       # -----------------------------------------------------------------------
       # Cleanup
